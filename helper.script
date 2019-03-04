@@ -1,0 +1,240 @@
+# get ID and TCGA_ID for mutation files:
+ls mutation.jan2018/ | while read line; do curl 'https://api.gdc.cancer.gov/files/'$line'?pretty=true' >> mutation_id.txt; done &
+
+##### COUNT DATA:
+# get ID and TCGA_ID for count files:
+ls count.jan2018/ | while read line; do curl 'https://api.gdc.cancer.gov/files/'$line'?fields=file_name,file_id,cases.case_id,cases.submitter_id&pretty=true' >> count_id_true_true.txt; done &
+
+# PROCESS: coordinate count data with ID"
+grep "file_name" count_id.txt | while read line; do echo $line | awk -F'[ ,"]' '{print $(NF-2)}'; done
+grep "file_id" count_id.txt | while read line; do echo $line | awk -F'[ ,"]' '{print $(NF-1)}' >> file_id.txt; done &
+grep "case_id" count_id.txt | while read line; do echo $line | awk -F'[ ,"]' '{print $(NF-2)}' >> case_id.txt; done &
+grep "submitter_id" count_id.txt | while read line; do echo $line | awk -F'[ ,"]' '{print $(NF-1)}' >> tcga_id.txt; done &
+grep "sample_type" count_id.txt | while read line; do echo $line | awk -F'[ ,"]' '{print $(NF-1)}' >> tcga_id.txt; done &
+sample_type
+
+# GUNZIP:
+for i in count.jan2018/*/*.gz
+do
+gunzip $i
+done
+
+# MAKE EXPRESSION TABLE: get full TCGA expression matrix for selected genes: 
+grep "FPKM-UQ" count.config | \
+while read TCGAID FILENAME FILEID CASEID TYPE FILENAMEFULL
+do
+cat count.jan2018/$FILEID/*.txt | \
+while read line
+do 
+echo "$TCGAID $line" >> count.table.fpkm-uq.txt
+done
+done
+
+grep "htseq" count.config | \ 
+while read TCGAID FILENAME FILEID CASEID TYPE FILENAMEFULL
+do
+cat count.jan2018/$FILEID/*.counts | \ 
+while read line
+do 
+echo "$TCGAID $line" >> count.table.htseq.txt
+done
+done
+
+grep "FPKM" count.config | grep -v "FPKM-UQ" \  
+while read TCGAID FILENAME FILEID CASEID TYPE FILENAMEFULL
+do
+cat count.jan2018/$FILEID/*.txt | \
+while read line
+do
+echo "$TCGAID $line" >> count.table.fpkm.txt
+done
+done
+
+ 
+FLAG=$2
+
+
+
+
+
+
+#### BIOSPECIMENT DATA:
+# GET MSI DATA from BIOSPECIMENT:
+for i in data_biospeciment/*/*.xml; do TCGA=$(echo $i | awk -F'.' '{print $3}'); MSI=$(grep -m 1 "msi_mono_di_nucleotide_assay_status" $i | awk -F'[<>]' '{print $3}' ); TYPE=$(grep -m 1 "admin:disease_code" $i | awk -F'[<>]' '{print $3}'); CASEID=$(grep -m 1 "shared:bcr_patient_uuid" $i | awk -F'[<>]' '{print $3}'); echo "$CASEID $TCGA $TYPE $MSI" >> MSI_STATUS.list; done
+
+#### MUTATION DATA:
+# PROCESS: coordinate mutation data with ID:
+grep "file_name" mutation_id.txt | while read line; do echo $line | awk -F'[ ,"]' '{print $(NF-2)}' >> file_name.mutation; done &
+grep "file_id" mutation_id.txt | while read line; do echo $line | awk -F'[ ,"]' '{print $(NF-2)}' >> file_id.txt; done &
+grep "submitter_id" mutation_id.txt | while read line; do echo $line | awk -F'[ ,"]' '{print $(NF-2)}' >> tcga_id.txt; done &
+
+# MERGE: join all mutation files in one, sorting by mutation position:
+mkdir mutation_merged.jan2018
+while read TCGA MS VS SS MU
+do
+gunzip mutation.jan2018/$MS/$MS.*.gz
+gunzip mutation.jan2018/$VS/$VS.*.gz
+gunzip mutation.jan2018/$SS/$SS.*.gz
+gunzip mutation.jan2018/$MU/$MU.*.gz
+cat mutation.jan2018/$MS/$MS.* >> mutation_merged.jan2018/$TCGA.merged.vcf
+cat mutation.jan2018/$VS/$VS.* >> mutation_merged.jan2018/$TCGA.merged.vcf
+cat mutation.jan2018/$SS/$SS.* >> mutation_merged.jan2018/$TCGA.merged.vcf
+cat mutation.jan2018/$MU/$MU.* >> mutation_merged.jan2018/$TCGA.merged.vcf
+
+sort -V -k1,1 -k2,2 < mutation_merged.jan2018/$TCGA.merged.vcf > mutation_merged.jan2018/$TCGA.merged.sorted.vcf
+rm mutation_merged.jan2018/$TCGA.merged.vcf
+done < mutation_input.sorted.txt &
+
+# verify merging:
+for i in mutation_merged.jan2018/*
+do
+ID=$(echo $i | awk -F'[./]' '{print $3}')
+cat $i | grep "##SAMPLE=" | awk -F'[=,]' '{print $5}' | while read line; do
+echo "$ID $line" >> merge.check.txt
+done
+done
+
+# CLEAN: merge all mutations by the same coordinate and remove comments
+for i in mutation_merged.jan2018/*.vcf;
+do
+ID=$(echo $i | awk -F'[./]' '{print $3}')
+cat $i | awk 'BEGIN {OFS="\t"} {print $1"_"$2"_"$4"_"$5,$7,$8"_"$9"_"$10"_"$11}' | awk '{A[$1] = A[$1] ? A[$1] ";" $2 "\t" $3  : $1 "\t" $2 "\t" $3} END {for ( k in A ) print A[k] }' >> mutation_merged_cleaned.jan2018/$ID.vcf
+done
+
+# verify cleaning:
+for i in mutation_merged_cleaned.jan2018/*.vcf
+do 
+ID=$(echo $i | awk -F'[./]' '{print $(NF-1)}')
+AFTER=$(cat $i | grep -v "#" | wc -l)
+BEFORE=$(cat mutation_merged.jan2018/$ID.merged.sorted.vcf | grep -v "#" | wc -l)
+echo "$ID $BEFORE $AFTER" >> cleaned.check.txt
+done
+
+# MUTATION STATISTICS: get overall statistics on different types of mutations by annotation.
+for i in mutation_merged_cleaned.jan2018/*.vcf
+do
+ID=$(echo $i | awk -F'[./]' '{print $(NF-1)}')
+variant=$(grep "PASS" $i | grep "variant" | wc -l)
+missense=$(grep "PASS" $i | grep "variant" | grep "missense" | wc -l)
+insertion=$(grep "PASS" $i | grep "variant" | grep "insertion" | wc -l)
+deletion=$(grep "PASS" $i | grep "variant" | grep "deletion" | wc -l)
+frameshift=$(grep "PASS" $i | grep "variant" | grep "frameshift" | wc -l)
+echo "$ID $variant $missense $insertion $deletion $frameshift" >> mutation_stats.txt
+done
+
+
+
+# Get genes, where frameshifts are happening:
+# frameshift:
+for i in mutation_merged_cleaned.jan2018/*.vcf; do ID=$(echo $i | awk -F'[./]' '{print $(NF-1)}'); grep "frameshift" $i | sed "s/frameshift_variant/ /g" | while read line; do position=$(echo $line | awk '{print $1}'); protein=$(echo $line | awk '{print $4}' | awk -F'|' '{print $3}'); ENSG=$(echo $line | awk '{print $4}' | awk -F'|' '{print $4}'); echo "$ID $position $protein $ENSG" >> frameshift.genelist; done; done &
+
+#missense:
+for i in mutation_merged_cleaned.jan2018/*.vcf; do ID=$(echo $i | awk -F'[./]' '{print $(NF-1)}'); grep "missense" $i | sed "s/missense_variant/ /g" | while read line; do protein=$(echo $line | awk '{print $4}' | awk -F'|' '{print $3}'); echo "$ID $protein" >> missense.genelist; done; done 
+sort -k 1,1 -k 2,2 < missense.genelist > tmp.txt; cat tmp.txt | uniq > missense.sorted.genelist; rm tmp.txt
+
+
+
+
+
+# Predict neoantigens from frameshits.  Also write them with aware of missense mutations
+# happening in the same gene, downstream of the frameshift
+# START with file containing GENE and TCGA-ID. Script is writen in python
+while read GENE ID
+do
+COUNT_FRAMESHIFT=$(grep "PASS" mutation_merged_cleaned.jan2018/$ID.vcf | grep "variant" | grep "frameshift" | grep "|"$GENE"|" | wc -l)
+COUNT_MISSENSE=$(grep "PASS" mutation_merged_cleaned.jan2018/$ID.vcf | grep "variant" | grep "missense" | grep "|"$GENE"|" | wc -l)
+
+grep "PASS" mutation_merged_cleaned.jan2018/$ID.vcf | grep "variant" | grep "frameshift" | grep "|"$GENE"|" | sed "s/frameshift_variant/ /g" | while read line; do \
+ENSGID=$(echo $line | awk '{print $4}' | awk -F'|' '{print $4}')
+ENSTID=$(echo $line | awk '{print $4}' | awk -F'|' '{print $6}')
+INDEL=$(echo $line | awk '{print $4}' | awk -F'|' '{print $10}' | awk -F'.' '{print $3}')
+ENSPID=$(echo $line | awk '{print $4}' | awk -F'|' '{print $11}' | awk -F'.' '{print $1}')
+CDSPOS=$(echo $line | awk '{print $4}' | awk -F'|' '{print $13}')
+PROTPOS=$(echo $line | awk '{print $4}' | awk -F'|' '{print $14}')
+
+echo "$COUNT_FRAMESHIFT $COUNT_MISSENSE $ID $GENE $ENSGID $ENSTID $INDEL $ENSPID $CDSPOS $PROTPOS" >> test.txt
+done
+done < "genelist.txt"
+
+
+# R script use Biomart to get CDS sequence:
+#
+#
+# library("biomaRt")
+# mart <- useMart("ENSEMBL_MART_ENSEMBL",dataset="hsapiens_gene_ensembl", host="dec2016.archive.ensembl.org")
+# seq = getSequence(id="ENST00000444749", type="ensembl_transcript_id", seqType="coding", mart = mart, verbose=FALSE)
+# exportFASTA(seq, "filename")
+#
+
+#### make fasta file from the netMHC peptide predictions:
+num=0
+while read TCGAID SEQID TOOL TYPE HLA PEPTIDE SCORE; 
+do 
+echo ">$num$SEQID" >> missense.neoantigen.netMHC.score.fasta; 
+echo "$PEPTIDE" >> missense.neoantigen.netMHC.score.fasta; 
+num=$(($num + 1))
+done < missense.neoantigen.netMHC.score.txt &
+
+### blast 9-mer peptides versus database of viral/bacterial epitopes
+# make database for blastp:
+makeblastdb -in iedb.fasta -parse_seqids -dbtype prot
+# run blast with frameshifts:
+nohup blastp -db iedb.fasta -query frameshift.neoantigen.netMHC.score.fasta -outfmt "6 qseqid sseqid pident ppos positive mismatch gapopen length qlen slen qstart qend sstart send qseq sseq evalue bitscore" -word_size 3 -gapopen 32767 -gapextend 32767 -evalue 1 -max_hsps_per_subject 1 -matrix BLOSUM62 -max_target_seqs 10000000 -out frameshift.neoantigen.iedb.blast.out &
+
+nohup blastp -db human.proteome.fasta -query frameshift.neoantigen.netMHC.score.fasta -outfmt "6 qseqid sseqid pident ppos positive mismatch gapopen length qlen slen qstart qend sstart send qseq sseq evalue bitscore" -word_size 3 -gapopen 32767 -gapextend 32767 -evalue 1 -max_hsps_per_subject 1 -matrix BLOSUM62 -max_target_seqs 10000000 -out frameshift.neoantigen.human.proteome.blast.out &
+
+# run blast with missense:
+nohup blastp -db iedb.fasta -query missense.neoantigen.netMHC.score.fasta -outfmt "6 qseqid sseqid pident ppos positive mismatch gapopen length qlen slen qstart qend sstart send qseq sseq evalue bitscore" -word_size 3 -gapopen 32767 -gapextend 32767 -evalue 1 -max_hsps_per_subject 1 -matrix BLOSUM62 -max_target_seqs 10000000 -out missense.neoantigen.iedb.blast.out &
+
+nohup blastp -db human.proteome.fasta -query missense.neoantigen.netMHC.score.fasta -outfmt "6 qseqid sseqid pident ppos positive mismatch gapopen length qlen slen qstart qend sstart send qseq sseq evalue bitscore" -word_size 3 -gapopen 32767 -gapextend 32767 -evalue 1 -max_hsps_per_subject 1 -matrix BLOSUM62 -max_target_seqs 10000000 -out missense.neoantigen.human.proteome.blast.out &
+
+# run last for human proteome:
+# make database:
+lastdb -p human.proteome human.proteome.fasta
+# run:
+lastal -f MAF -r 2 -q 1 -m 100000000 -a 100000 -d 15 -l 4 -k 1 -j1 -P 10 human.proteome frameshift.neoantigen.netMHC.score.fasta > frameshift.neoantigen.human.last.out
+lastal -f MAF -r 2 -q 1 -m 100000000 -a 100000 -d 15 -l 4 -k 1 -j1 -P 10 human.proteome missense.neoantigen.netMHC.score.fasta > missense.neoantigen.human.last.out
+
+# count the result output of findings:
+grep "seqID" missense.neoantigen.human.last.out | awk '{print $2}' | sort | uniq | wc -l
+
+# count epitopes per mutation:
+#
+nohup grep ">" frameshift.peptide.fasta | awk -F'[>-]' '{print $2}' | while read seqid; do count=$(grep -A1 -w "$seqid" frameshift_epitope/frameshift.neoantigen.netMHC.score.fasta | grep -v "$seqid" | sort | uniq | wc -l); echo "$seqid $count" >> true_epitope_per_frameshift.txt; done &
+nohup grep ">" missense.peptide.fasta | awk -F'[>-]' '{print $2}' | while read seqid; do count=$(grep -A1 "$seqid\>" missense_epitope/missense.neoantigen.netMHC.score.fasta | grep -v "$seqid\>" | sort | uniq | wc -l); echo "$seqid $count" >> true_epitope_per_missense.txt; done &
+
+# compare to human proteome:
+# similar match# similar match:
+awk '$1 >14' missense.neoantigen.human.last.tab | awk '{print $7}' | sort | uniq | wc -l
+# perfect match:
+awk '$1 >15' missense.neoantigen.human.last.tab | awk '$4=9' | awk '{print $7}' | sort | uniq | wc -l:
+# use above commands for frameshift and missense outputs of last tool. before, change the maf format to tab:
+maf-convert -p tab missense.neoantigen.human.last.out > missense.neoantigen.human.last.tab
+
+# compare to virus proteome:
+# get all matches of length 9:
+awk '$8 == 9' missense.neoantigen.iedb.blast.out | wc -l
+# get all perfect matches of length 9 between tumor epitopes and viruses:
+awk '$8 == 9' ../frameshift_epitope/frameshift.neoantigen.iedb.blast.out | awk '$4 == 100' | wc -l
+
+awk '$8 == 9' frameshift_epitope/frameshift.neoantigen.iedb.blast.out | awk '$4 == 100' | awk '$6 < 1' | awk '{print $15}' | sort | uniq | wc -l
+awk '$8 == 8' frameshift_epitope/frameshift.neoantigen.iedb.blast.out | awk '$4 == 100' | awk '$6 < 1' | awk '{print $15}' | sort | uniq | wc -l
+
+
+
+# get statistics for shared epitopes:
+#
+# count original peptides, encoding target epitope:
+while read line; do grep "$line" frameshift.peptide.fasta | sort | uniq | wc -l >> mss.coad.count-peptides.txt; done < mss.coad.epitopes.list
+
+# get original gene, encoding target epitope:
+while read epitope; do grep -B1 "$epitope" frameshift.peptide.fasta | grep ">" | head -1 | awk -F'-' '{print $2}' >> mss.coad.gene.txt; done < mss.coad.epitopes.list
+
+# get total amount of frmeshifts, and those PASSed filters:
+while read gene; do total=$(grep "$gene" frameshift.coordinate.txt | wc -l); pass=$(grep "$gene" frameshift.coordinate.txt | awk '$3 == 1' | wc -l); echo "$total $pass" >> mss.ucec.quality.txt; done < mss.ucec.gene.txt
+
+
+
+
+
+
